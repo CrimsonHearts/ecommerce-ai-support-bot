@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
 E-Commerce AI Support Bot - Web Version
-Deployed on Render (or any Flask host)
+Supports OpenAI, Kimi (Moonshot), or local models
 """
 
 import os
 import json
+import requests
 from flask import Flask, request, jsonify, render_template_string
-from openai import OpenAI
 from orders_db import lookup_order, get_status_message
 
 app = Flask(__name__)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# AI Provider Configuration
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()  # openai, kimi, or local
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+KIMI_API_KEY = os.getenv("KIMI_API_KEY")
+LOCAL_API_URL = os.getenv("LOCAL_API_URL", "http://localhost:11434/v1/chat/completions")
 
 SYSTEM_PROMPT = """You are a helpful, friendly customer support bot for an e-commerce store called TechGear.
 Your job is to help customers check their order status.
@@ -22,6 +27,62 @@ Guidelines:
 - Keep responses concise but complete
 - If order not found, ask them to double-check the info
 - Offer to connect to human support for complex issues"""
+
+
+def get_ai_response(messages):
+    """Get response from configured AI provider."""
+    
+    if AI_PROVIDER == "kimi" and KIMI_API_KEY:
+        # Kimi/Moonshot API
+        response = requests.post(
+            "https://api.moonshot.cn/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {KIMI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "moonshot-v1-8k",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 200
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    
+    elif AI_PROVIDER == "local":
+        # Local model (Ollama, etc.)
+        response = requests.post(
+            LOCAL_API_URL,
+            json={
+                "model": os.getenv("LOCAL_MODEL", "llama2"),
+                "messages": messages,
+                "stream": False
+            },
+            timeout=60
+        )
+        response.raise_for_status()
+        data = response.json()
+        # Handle different local API formats
+        if "message" in data:
+            return data["message"]["content"]
+        elif "choices" in data:
+            return data["choices"][0]["message"]["content"]
+        return str(data)
+    
+    else:
+        # Default: OpenAI
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=200
+        )
+        return response.choices[0].message.content
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -213,7 +274,7 @@ def chat():
     user_message = data.get('message', '')
     conversation = data.get('history', [])
     
-    # Build messages for OpenAI
+    # Build messages
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(conversation)
     messages.append({"role": "user", "content": user_message})
@@ -240,13 +301,7 @@ def chat():
     
     # Get AI response
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=200
-        )
-        bot_response = response.choices[0].message.content
+        bot_response = get_ai_response(messages)
     except Exception as e:
         bot_response = f"I'm having trouble right now. Please try again later."
     
@@ -267,7 +322,7 @@ def chat():
 @app.route('/health')
 def health():
     """Health check endpoint."""
-    return jsonify({'status': 'healthy'})
+    return jsonify({'status': 'healthy', 'provider': AI_PROVIDER})
 
 
 if __name__ == '__main__':
