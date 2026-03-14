@@ -18,6 +18,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 KIMI_API_KEY = os.getenv("KIMI_API_KEY")
 LOCAL_API_URL = os.getenv("LOCAL_API_URL", "http://localhost:11434/v1/chat/completions")
 
+# WhatsApp Configuration
+WHATSAPP_ENABLED = os.getenv("WHATSAPP_ENABLED", "false").lower() == "true"
+WHATSAPP_WHITELIST = os.getenv("WHATSAPP_WHITELIST", "").split(",")  # Comma-separated phone numbers
+WHATSAPP_WHITELIST = [num.strip() for num in WHATSAPP_WHITELIST if num.strip()]  # Clean up
+WHATSAPP_API_KEY = os.getenv("WHATSAPP_API_KEY")  # For WhatsApp Business API or third-party service
+
+# In-memory session storage for WhatsApp conversations
+whatsapp_sessions = {}
+
 SYSTEM_PROMPT = """You are a helpful, friendly customer support bot for an e-commerce store called TechGear.
 Your job is to help customers check their order status.
 
@@ -323,6 +332,157 @@ def chat():
 def health():
     """Health check endpoint."""
     return jsonify({'status': 'healthy', 'provider': AI_PROVIDER})
+
+
+# WhatsApp Webhook Endpoints
+@app.route('/whatsapp/webhook', methods=['GET'])
+def whatsapp_verify():
+    """Verify webhook for WhatsApp Business API."""
+    # Meta/WhatsApp verification
+    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+    mode = request.args.get('hub.mode')
+    token = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
+    
+    if mode == 'subscribe' and token == verify_token:
+        return challenge, 200
+    return 'Verification failed', 403
+
+
+@app.route('/whatsapp/webhook', methods=['POST'])
+def whatsapp_webhook():
+    """Receive WhatsApp messages."""
+    if not WHATSAPP_ENABLED:
+        return jsonify({'status': 'WhatsApp not enabled'}), 400
+    
+    data = request.json
+    
+    try:
+        # Extract message data (Meta/WhatsApp Business API format)
+        entry = data.get('entry', [{}])[0]
+        changes = entry.get('changes', [{}])[0]
+        value = changes.get('value', {})
+        messages = value.get('messages', [])
+        
+        if not messages:
+            return jsonify({'status': 'No messages'}), 200
+        
+        message = messages[0]
+        phone_number = message.get('from')  # Sender's phone number
+        message_text = message.get('text', {}).get('body', '')
+        
+        # Check whitelist
+        if WHATSAPP_WHITELIST and phone_number not in WHATSAPP_WHITELIST:
+            send_whatsapp_message(phone_number, "Sorry, you're not authorized to use this service.")
+            return jsonify({'status': 'Unauthorized'}), 403
+        
+        # Get or create session
+        if phone_number not in whatsapp_sessions:
+            whatsapp_sessions[phone_number] = []
+        
+        conversation = whatsapp_sessions[phone_number]
+        
+        # Build messages for AI
+        messages_for_ai = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages_for_ai.extend(conversation)
+        messages_for_ai.append({"role": "user", "content": message_text})
+        
+        # Extract potential order info
+        potential_query = None
+        words = message_text.split()
+        for word in words:
+            if word.upper().startswith("ORD-") or word.startswith("#") or word.isdigit():
+                potential_query = word.replace("#", "")
+                break
+            if "@" in word:
+                potential_query = word
+                break
+        
+        # Look up order if found
+        if potential_query:
+            order_info = lookup_order(potential_query)
+            if order_info.get("found"):
+                status_msg = get_status_message(order_info)
+                messages_for_ai.append({"role": "system", "content": f"[Order found: {order_info['order_id']}. {status_msg}]"})
+            else:
+                messages_for_ai.append({"role": "system", "content": f"[No order found for: {potential_query}]"})
+        
+        # Get AI response
+        try:
+            bot_response = get_ai_response(messages_for_ai)
+        except Exception as e:
+            bot_response = "I'm having trouble right now. Please try again later."
+        
+        # Update session
+        conversation.append({"role": "user", "content": message_text})
+        conversation.append({"role": "assistant", "content": bot_response})
+        
+        # Keep history manageable
+        if len(conversation) > 20:
+            conversation = conversation[-20:]
+        
+        # Send response back via WhatsApp
+        send_whatsapp_message(phone_number, bot_response)
+        
+        return jsonify({'status': 'Message processed'}), 200
+        
+    except Exception as e:
+        return jsonify({'status': 'Error', 'message': str(e)}), 500
+
+
+def send_whatsapp_message(phone_number, message):
+    """Send message via WhatsApp Business API or third-party service."""
+    # This uses Meta's WhatsApp Business API
+    # You'll need to set up a WhatsApp Business account and get access token
+    
+    business_phone_id = os.getenv("WHATSAPP_BUSINESS_PHONE_ID")
+    access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+    
+    if not business_phone_id or not access_token:
+        print(f"[WhatsApp not configured] To {phone_number}: {message}")
+        return
+    
+    url = f"https://graph.facebook.com/v18.0/{business_phone_id}/messages"
+    
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone_number,
+        "type": "text",
+        "text": {"body": message}
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Failed to send WhatsApp message: {e}")
+
+
+@app.route('/whatsapp/send', methods=['POST'])
+def whatsapp_send_manual():
+    """Manual endpoint to send WhatsApp message (for testing)."""
+    if not WHATSAPP_ENABLED:
+        return jsonify({'error': 'WhatsApp not enabled'}), 400
+    
+    data = request.json
+    phone_number = data.get('phone')
+    message = data.get('message')
+    
+    if not phone_number or not message:
+        return jsonify({'error': 'Phone and message required'}), 400
+    
+    # Check whitelist
+    if WHATSAPP_WHITELIST and phone_number not in WHATSAPP_WHITELIST:
+        return jsonify({'error': 'Phone number not whitelisted'}), 403
+    
+    send_whatsapp_message(phone_number, message)
+    return jsonify({'status': 'Message sent'}), 200
 
 
 if __name__ == '__main__':
